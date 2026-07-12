@@ -33,7 +33,11 @@
 html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); overflow: hidden; }
 
 #app { height: 100%; display: flex; flex-direction: column; max-width: 430px; margin: 0 auto; }
-.screen { flex: 1; overflow-y: auto; padding: 20px 16px 90px; display: none; }
+.screen { 
+  flex: 1; overflow-y: auto; 
+  padding: calc(env(safe-area-inset-top) + 16px) 16px calc(env(safe-area-inset-bottom) + 90px);
+  display: none; 
+}
 .screen.active { display: block; }
 .screen::-webkit-scrollbar { display: none; }
 
@@ -43,7 +47,9 @@ nav {
   border-top: 1px solid var(--border);
   background: rgba(13,13,15,0.95);
   backdrop-filter: blur(12px);
-  padding-bottom: env(safe-area-inset-bottom);
+  padding: 6px 0 max(8px, env(safe-area-inset-bottom));
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
   flex-shrink: 0;
   position: relative;
   z-index: 10;
@@ -61,7 +67,8 @@ nav button svg { width: 18px; height: 18px; stroke-width: 1.5; }
 /* SETUP SCREEN */
 #setup-screen {
   display: flex; flex-direction: column; justify-content: center;
-  align-items: center; height: 100%; padding: 32px;
+  align-items: center; height: 100%; 
+  padding: calc(env(safe-area-inset-top) + 32px) 32px calc(env(safe-area-inset-bottom) + 32px);
   text-align: center; gap: 24px;
 }
 .setup-logo { font-family: var(--display); font-size: 52px; letter-spacing: 4px; color: var(--accent); }
@@ -632,14 +639,14 @@ nav button svg { width: 18px; height: 18px; stroke-width: 1.5; }
     </div>
 
     <!-- CHAT -->
-    <div id="screen-chat" class="screen" style="display:none;padding-bottom:0;">
+    <div id="screen-chat" class="screen" style="padding-bottom:0;">
       <div class="page-header" style="padding-bottom:0;">
         <div class="page-title">ASK</div>
         <div style="font-family:var(--mono);font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px;" id="chat-model-label"></div>
       </div>
-      <div id="chat-content" style="flex:1;display:flex;flex-direction:column;height:calc(100vh - 200px);">
-        <div id="chat-messages" style="flex:1;overflow-y:auto;padding:4px 0 12px;display:flex;flex-direction:column;gap:10px;"></div>
-        <div style="display:flex;gap:8px;padding:12px 0;border-top:1px solid var(--border);flex-shrink:0;">
+      <div id="chat-content" style="display:flex;flex-direction:column;">
+        <div id="chat-messages" style="min-height:200px;padding:4px 0 12px;display:flex;flex-direction:column;gap:10px;"></div>
+        <div style="display:flex;gap:8px;padding:12px 0;border-top:1px solid var(--border);">
           <input id="chat-input" type="text" placeholder="Ask about your health data..."
             style="flex:1;background:var(--surface);border:1px solid var(--border);border-radius:10px;
             padding:12px 14px;color:var(--text);font-family:var(--sans);font-size:14px;outline:none;"
@@ -973,15 +980,23 @@ async function setupConnect() {
     cfg = { url, email, token, userId };
     save('vitals_cfg', cfg);
     showApp();
-  } catch(e) { showErr('Connection failed — check URL and credentials'); }
+  } catch(e) { showErr(e.message || 'Connection failed — check URL and credentials'); }
   function showErr(msg) { errEl.textContent = msg; errEl.style.display = 'block'; }
 }
 
 async function login(url, email, password) {
   const body = new URLSearchParams({ username: email, password });
-  const r = await fetch(`${url}/api/v1/auth/login`, { method: 'POST', body });
-  if (!r.ok) throw new Error('Login failed');
+  const r = await fetch(`${url}/api/v1/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  if (!r.ok) {
+    const text = await r.text().catch(() => '');
+    throw new Error(`Login failed (${r.status}): ${text}`);
+  }
   const d = await r.json();
+  if (!d.access_token) throw new Error('No token in response');
   return d.access_token;
 }
 
@@ -1046,6 +1061,86 @@ const Scores = {
     // RHR modifier: subtract up to 15 points if RHR is elevated
     const rhrPenalty = latestRhr ? Math.max(0, (latestRhr - 65) * 1.5) : 0;
     return Math.max(0, Math.round(hrvPct - rhrPenalty));
+  },
+
+  // Sleep proxy — estimates sleep window and quality from overnight HR + respiratory rate
+  // when OW's sleep_details table is missing data for a given night (known gap in the
+  // Apple Health ingestion path per OW's own docs — sleep session stitching is less
+  // reliable there than direct provider APIs like Oura).
+  // Looks for the longest sustained low-HR period between 6pm and 11am as the sleep window.
+  sleepProxy(hrReadings, respReadings, baselineRhr) {
+    if (!hrReadings.length) return null;
+
+    const sorted = [...hrReadings].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    const threshold = (baselineRhr || 70) + 12; // sleep HR is typically at/near resting HR
+
+    // Find the longest contiguous run where HR stays under threshold
+    let bestStart = null, bestEnd = null, bestDuration = 0;
+    let runStart = null, runValues = [];
+    let bestValues = [];
+
+    for (let i = 0; i < sorted.length; i++) {
+      const point = sorted[i];
+      const t = new Date(point.timestamp);
+      if (point.value <= threshold) {
+        if (runStart === null) runStart = t;
+        runValues.push(point.value);
+      } else {
+        if (runStart !== null) {
+          const dur = (t - runStart) / 60000; // minutes
+          if (dur > bestDuration) {
+            bestDuration = dur; bestStart = runStart; bestEnd = t; bestValues = [...runValues];
+          }
+        }
+        runStart = null; runValues = [];
+      }
+    }
+    // Close out trailing run
+    if (runStart !== null && sorted.length) {
+      const lastT = new Date(sorted[sorted.length - 1].timestamp);
+      const dur = (lastT - runStart) / 60000;
+      if (dur > bestDuration) {
+        bestDuration = dur; bestStart = runStart; bestEnd = lastT; bestValues = [...runValues];
+      }
+    }
+
+    if (!bestStart || bestDuration < 60) return null; // require at least 1hr to count as sleep
+
+    const avgHr = bestValues.reduce((s, v) => s + v, 0) / bestValues.length;
+    const minHr = Math.min(...bestValues);
+
+    // Respiratory rate during the same window
+    let avgResp = null, respStability = null;
+    if (respReadings && respReadings.length) {
+      const windowResp = respReadings.filter(r => {
+        const t = new Date(r.timestamp);
+        return t >= bestStart && t <= bestEnd;
+      });
+      if (windowResp.length) {
+        const vals = windowResp.map(r => r.value);
+        avgResp = vals.reduce((s, v) => s + v, 0) / vals.length;
+        const variance = vals.reduce((s, v) => s + Math.pow(v - avgResp, 2), 0) / vals.length;
+        respStability = Math.sqrt(variance); // lower = more stable breathing = better quality signal
+      }
+    }
+
+    // Quality estimate: reward longer duration, lower avg HR relative to baseline, stable breathing
+    let qualityScore = 50;
+    qualityScore += Math.min(30, (bestDuration - 300) / 10); // bonus for duration beyond 5hrs
+    if (baselineRhr) qualityScore += Math.max(-20, Math.min(20, (baselineRhr - avgHr) * 2));
+    if (respStability !== null) qualityScore -= Math.min(15, respStability * 5);
+    qualityScore = Math.max(0, Math.min(100, Math.round(qualityScore)));
+
+    return {
+      estimated: true,
+      startTime: bestStart,
+      endTime: bestEnd,
+      durationMinutes: Math.round(bestDuration),
+      avgHr: Math.round(avgHr * 10) / 10,
+      minHr: Math.round(minHr),
+      avgRespRate: avgResp ? Math.round(avgResp * 10) / 10 : null,
+      qualityScore,
+    };
   },
 
   // Stress signal text for afternoon mode context card
@@ -1120,23 +1215,25 @@ async function loadToday() {
 }
 
 async function loadMorningMode(now, yesterday, week) {
-  const [hrv, rhr, spo2, scores, sleepEvents] = await Promise.allSettled([
-    fetchSeries('heart_rate_variability_sdnn', week.toISOString(), now.toISOString()),
-    fetchSeries('resting_heart_rate', week.toISOString(), now.toISOString()),
-    fetchSeries('oxygen_saturation', week.toISOString(), now.toISOString()),
+  // Fetch all needed series in two batched calls
+  const [weekData, scores, sleepEvents] = await Promise.allSettled([
+    OW.series(['heart_rate_variability_sdnn', 'resting_heart_rate', 'oxygen_saturation'], week.toISOString(), now.toISOString(), 100),
     fetchHealthScores(),
     fetchSleepEvents(yesterday.toISOString(), now.toISOString()),
   ]);
 
-  // Health scores
+  const allData = weekData.status === 'fulfilled' ? weekData.value : [];
+  const hrv = OW.filterType(allData, 'heart_rate_variability_sdnn');
+  const rhr = OW.filterType(allData, 'resting_heart_rate');
+  const spo2 = OW.filterType(allData, 'oxygen_saturation');
+
   const scoreData = scores.status === 'fulfilled' ? scores.value : [];
   const sleepScore = scoreData.find(s => s.category === 'sleep');
   const resScore = scoreData.find(s => s.category === 'resilience');
 
-  // Ring — show sleep score if available, otherwise HRV
-  const hrvData = hrv.status === 'fulfilled' ? hrv.value : [];
-  const latestHrv = hrvData.length ? Math.round(hrvData[hrvData.length-1].value) : null;
-  if (sleepScore) {
+  // Ring — show sleep score if available and server scores enabled, otherwise HRV
+  const latestHrv = hrv.length ? Math.round(hrv[hrv.length-1].value) : null;
+  if (sleepScore && VITALS_CONFIG.useServerScores) {
     renderRingGeneric('morning', Math.round(sleepScore.value), 100, 'SLEEP SCORE',
       sleepScore.value >= 80 ? 'var(--green)' : sleepScore.value >= 60 ? 'var(--yellow)' : 'var(--red)',
       sleepScore.value >= 80 ? '● GREAT SLEEP' : sleepScore.value >= 60 ? '● FAIR SLEEP' : '● POOR SLEEP');
@@ -1145,8 +1242,7 @@ async function loadMorningMode(now, yesterday, week) {
   }
 
   // Resting HR
-  const rhrData = rhr.status === 'fulfilled' ? rhr.value : [];
-  const latestRhr = rhrData.length ? Math.round(rhrData[rhrData.length-1].value) : null;
+  const latestRhr = rhr.length ? Math.round(rhr[rhr.length-1].value) : null;
   setMetric('metric-rhr-m', latestRhr, null);
   if (latestRhr) {
     const rhrColor = latestRhr < 70 ? 'var(--green)' : latestRhr < 80 ? 'var(--yellow)' : 'var(--red)';
@@ -1162,25 +1258,26 @@ async function loadMorningMode(now, yesterday, week) {
   }
 
   // Sleep score & resilience
-  if (sleepScore) {
+  if (sleepScore && VITALS_CONFIG.useServerScores) {
     document.getElementById('sleep-score-m').textContent = Math.round(sleepScore.value);
     document.getElementById('sleep-score-note-m').textContent = '';
   }
-  if (resScore) {
+  if (resScore && VITALS_CONFIG.useServerScores) {
     document.getElementById('resilience-m').textContent = Math.round(resScore.value);
     document.getElementById('resilience-note-m').textContent = '';
   }
 
   // SpO2
-  const spo2Data = spo2.status === 'fulfilled' ? spo2.value : [];
-  const latestSpo2 = spo2Data.length ? Math.round(spo2Data[spo2Data.length-1].value) : null;
+  const latestSpo2 = spo2.length ? Math.round(spo2[spo2.length-1].value) : null;
   setMetric('metric-spo2-m', latestSpo2, null);
 
-  // Sleep detail card
+  // Sleep detail card — falls back to HR/respiratory proxy if real sleep_details missing for last night
   const sleepData = sleepEvents.status === 'fulfilled' ? sleepEvents.value : [];
   const lastSleep = sleepData.find(e => !e.is_nap);
+  const hasRecentReal = lastSleep && (now - new Date(lastSleep.start_datetime)) < 36 * 3600 * 1000;
   const detailEl = document.getElementById('morning-sleep-detail');
-  if (lastSleep && lastSleep.details) {
+
+  if (hasRecentReal && lastSleep.details) {
     const d = lastSleep.details;
     const totalH = d.sleep_total_duration_minutes ? (d.sleep_total_duration_minutes / 60).toFixed(1) : '—';
     const deep = d.sleep_deep_minutes || 0;
@@ -1190,6 +1287,7 @@ async function loadMorningMode(now, yesterday, week) {
     const total = deep + rem + light + awake || 1;
     detailEl.innerHTML = `
       <div class="sleep-overview" style="margin-bottom:0;">
+        <div class="metric-eyebrow">Measured</div>
         <div class="sleep-duration">${totalH}<span style="font-family:var(--mono);font-size:16px;color:var(--muted);"> hrs</span></div>
         <div class="sleep-stages-bar">
           <div class="stage-deep" style="width:${deep/total*100}%"></div>
@@ -1204,20 +1302,50 @@ async function loadMorningMode(now, yesterday, week) {
           <div class="stage-item"><div class="stage-dot" style="background:#334155"></div>Awake ${awake}m</div>
         </div>
       </div>`;
+  } else {
+    // Fall back to overnight HR/respiratory proxy
+    try {
+      const windowStart = new Date(now); windowStart.setDate(windowStart.getDate() - 1); windowStart.setHours(18, 0, 0, 0);
+      const [hrData, respData] = await Promise.all([
+        OW.series(['heart_rate'], windowStart.toISOString(), now.toISOString(), 100),
+        OW.series(['respiratory_rate'], windowStart.toISOString(), now.toISOString(), 100),
+      ]);
+      const baselineRhr = latestRhr || 70;
+      const proxy = Scores.sleepProxy(hrData, respData, baselineRhr);
+      if (proxy) {
+        const hrs = (proxy.durationMinutes / 60).toFixed(1);
+        const qColor = proxy.qualityScore >= 70 ? 'var(--green)' : proxy.qualityScore >= 45 ? 'var(--yellow)' : 'var(--red)';
+        detailEl.innerHTML = `
+          <div class="sleep-overview" style="margin-bottom:0;">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;">
+              <div class="metric-eyebrow">Estimated</div>
+              <div style="font-family:var(--mono);font-size:9px;color:var(--muted);">from HR + breathing</div>
+            </div>
+            <div class="sleep-duration">${hrs}<span style="font-family:var(--mono);font-size:16px;color:var(--muted);"> hrs</span></div>
+            <div style="font-family:var(--mono);font-size:11px;color:${qColor};margin-top:6px;">
+              Quality estimate: ${proxy.qualityScore}/100
+            </div>
+          </div>`;
+      }
+    } catch(e) { /* leave placeholder if proxy also fails */ }
   }
 }
 
 async function loadAfternoonMode(now, todayStart, week) {
-  const [hr, steps, dist, spo2, hrv] = await Promise.allSettled([
-    fetchSeries('heart_rate', todayStart.toISOString(), now.toISOString()),
-    fetchSeries('steps', todayStart.toISOString(), now.toISOString()),
-    fetchSeries('distance_walking_running', todayStart.toISOString(), now.toISOString()),
-    fetchSeries('oxygen_saturation', week.toISOString(), now.toISOString()),
-    fetchSeries('heart_rate_variability_sdnn', week.toISOString(), now.toISOString()),
+  const [todayData, weekData] = await Promise.allSettled([
+    OW.series(['heart_rate', 'steps', 'distance_walking_running', 'oxygen_saturation'], todayStart.toISOString(), now.toISOString(), 100),
+    OW.series(['heart_rate_variability_sdnn'], week.toISOString(), now.toISOString(), 100),
   ]);
 
-  // Strain from today's HR — uses Scores layer (swappable to server when OW strain ships)
-  const hrData = hr.status === 'fulfilled' ? hr.value : [];
+  const allToday = todayData.status === 'fulfilled' ? todayData.value : [];
+  const hrData = OW.filterType(allToday, 'heart_rate');
+  const stepsData = OW.filterType(allToday, 'steps');
+  const distData = OW.filterType(allToday, 'distance_walking_running');
+  const spo2Data = OW.filterType(allToday, 'oxygen_saturation');
+  const allWeek = weekData.status === 'fulfilled' ? weekData.value : [];
+  const hrvData = OW.filterType(allWeek, 'heart_rate_variability_sdnn');
+
+  // Strain from today's HR
   const strain = await Scores.strain(hrData, null);
   setMetric('metric-strain-a', strain > 0 ? strain.toFixed(1) : null, null);
   setBar('bar-strain-a', (strain / 21) * 100, 'var(--strain)');
@@ -1227,9 +1355,8 @@ async function loadAfternoonMode(now, todayStart, week) {
   const strainStatus = strain >= 14 ? '● HIGH STRAIN' : strain >= 8 ? '● MODERATE STRAIN' : strain > 0 ? '● LOW STRAIN' : '● NO DATA YET';
   renderRingGeneric('afternoon', strain > 0 ? strain.toFixed(1) : '—', 21, 'STRAIN', strainColor, strainStatus);
 
-  // Stress context — uses Scores layer
+  // Stress context
   const avgHrToday = hrData.length ? hrData.reduce((s,d) => s+d.value, 0) / hrData.length : null;
-  const hrvData = hrv.status === 'fulfilled' ? hrv.value : [];
   const latestHrv = hrvData.length ? Math.round(hrvData[hrvData.length-1].value) : null;
   const contextCard = document.getElementById('stress-context-card');
   const contextText = document.getElementById('stress-context-text');
@@ -1240,14 +1367,12 @@ async function loadAfternoonMode(now, todayStart, week) {
   }
 
   // Steps
-  const stepsData = steps.status === 'fulfilled' ? steps.value : [];
   const totalSteps = stepsData.reduce((s, d) => s + d.value, 0);
   const stepsDisplay = totalSteps > 1000 ? (Math.round(totalSteps/100)/10) + 'k' : Math.round(totalSteps).toString();
   document.getElementById('metric-steps-a').textContent = totalSteps > 0 ? stepsDisplay : '—';
   setBar('bar-steps-a', Math.min(100, (totalSteps / 10000) * 100), 'var(--green)');
 
   // Distance
-  const distData = dist.status === 'fulfilled' ? dist.value : [];
   const totalDist = distData.reduce((s, d) => s + d.value, 0) / 1000;
   document.getElementById('metric-dist-a').textContent = totalDist > 0 ? totalDist.toFixed(1) : '—';
 
@@ -1255,7 +1380,6 @@ async function loadAfternoonMode(now, todayStart, week) {
   document.getElementById('metric-hr-a').textContent = avgHrToday ? Math.round(avgHrToday) : '—';
 
   // SpO2
-  const spo2Data = spo2.status === 'fulfilled' ? spo2.value : [];
   const latestSpo2 = spo2Data.length ? Math.round(spo2Data[spo2Data.length-1].value) : null;
   setMetric('metric-spo2-a', latestSpo2, null);
 }
@@ -1370,54 +1494,86 @@ function setMetric(id, val, suffix) {
 }
 
 // ─── API LAYER ────────────────────────────────────────────────────────────────
-// All Open Wearables endpoint calls live here. When OW changes an endpoint path,
-// changes a response shape, or adds dedicated scoring/automation endpoints,
-// update it in one place rather than hunting through the codebase.
-
 const OW = {
-  // Base authenticated GET
+  // Base authenticated GET — tries Bearer token first, falls back to API key
   async get(path) {
-    const r = await fetch(`${cfg.url}${path}`, {
-      headers: { 'Authorization': `Bearer ${cfg.token}` }
-    });
+    const headers = { 'Authorization': `Bearer ${cfg.token}` };
+    if (cfg.apiKey) headers['X-Open-Wearables-API-Key'] = cfg.apiKey;
+    const r = await fetch(`${cfg.url}${path}`, { headers });
     if (r.status === 401) { logout(); throw new Error('Session expired'); }
     if (!r.ok) return null;
     return r.json();
   },
 
-  // Normalize paginated or array responses
-  list(d) {
+  // Timeseries endpoint — fetches multiple types at once, paginates if needed
+  async series(types, from, to, limit = 100) {
+    if (!Array.isArray(types)) types = [types];
+    const params = new URLSearchParams({
+      start_time: from,
+      end_time: to,
+      limit: Math.min(limit, 100),
+    });
+    types.forEach(t => params.append('types', t));
+    const d = await OW.get(
+      `/api/v1/users/${cfg.userId}/timeseries?${params.toString()}`
+    );
     if (!d) return [];
-    return Array.isArray(d) ? d : (d.items || d.data || []);
+    // Response is { data: [...] }
+    const raw = Array.isArray(d) ? d : (d.data || d.items || d.results || []);
+    return raw;
   },
 
-  // Time-series data for a given metric code
-  async series(code, from, to, limit = 5000) {
-    const d = await OW.get(
-      `/api/v1/users/${cfg.userId}/series/${code}` +
-      `?start=${encodeURIComponent(from)}&end=${encodeURIComponent(to)}&limit=${limit}`
-    );
-    return OW.list(d);
+  // Paginated fetch — follows cursor until all records retrieved or maxPages reached
+  async seriesAll(types, from, to, maxPages = 10) {
+    if (!Array.isArray(types)) types = [types];
+    let all = [];
+    let cursor = null;
+    let page = 0;
+    while (page < maxPages) {
+      const params = new URLSearchParams({ start_time: from, end_time: to, limit: 100 });
+      types.forEach(t => params.append('types', t));
+      if (cursor) params.set('cursor', cursor);
+      const d = await OW.get(`/api/v1/users/${cfg.userId}/timeseries?${params.toString()}`);
+      if (!d) break;
+      const records = Array.isArray(d) ? d : (d.data || []);
+      all = all.concat(records);
+      cursor = d.pagination?.next_cursor;
+      if (!cursor || !d.pagination?.has_more) break;
+      page++;
+    }
+    return all;
+  },
+
+  // Filter timeseries results by type code
+  filterType(data, code) {
+    return data.filter(d => d.type === code);
   },
 
   // Events (sleep, workout) filtered by category
   async events(category, from, to, limit = 30) {
-    const d = await OW.get(
-      `/api/v1/users/${cfg.userId}/events` +
-      `?category=${category}&start=${encodeURIComponent(from)}&end=${encodeURIComponent(to)}&limit=${limit}`
-    );
+    const params = new URLSearchParams({
+      category,
+      start: from,
+      end: to,
+      limit,
+    });
+    const d = await OW.get(`/api/v1/users/${cfg.userId}/events?${params.toString()}`);
     return OW.list(d);
   },
 
-  // Platform-computed health scores (sleep, resilience, strain)
-  // v2: When OW scores populate reliably, VITALS_CONFIG.useServerScores = true
-  // and morning/afternoon modes switch to using these instead of computed values.
+  // Normalize paginated or array responses
+  list(d) {
+    if (!d) return [];
+    return Array.isArray(d) ? d : (d.items || d.data || d.results || []);
+  },
+
+  // Platform-computed health scores
   async scores(limit = 20) {
     const d = await OW.get(`/api/v1/users/${cfg.userId}/health-scores?limit=${limit}`);
     return OW.list(d);
   },
 
-  // v4: Ollama chat completion — called when VITALS_CONFIG.ollamaEnabled = true
+  // v4: Ollama chat
   async chat(messages, context) {
     if (!VITALS_CONFIG.ollamaEnabled) return null;
     const systemPrompt = `You are a personal health assistant with access to the user's wearable data.
@@ -1438,8 +1594,7 @@ Be concise, specific, and grounded in the actual data provided. Never give gener
     return d.message?.content || '';
   },
 
-  // v5: Natural language automations — called when VITALS_CONFIG.useAutomations = true
-  // Placeholder for when OW ships the automation API
+  // v5: Automations placeholder
   async automations() {
     if (!VITALS_CONFIG.useAutomations) return [];
     const d = await OW.get(`/api/v1/users/${cfg.userId}/automations`);
@@ -1447,8 +1602,11 @@ Be concise, specific, and grounded in the actual data provided. Never give gener
   },
 };
 
-// Legacy shims — keep these so existing callsites don't break during transition
-async function fetchSeries(code, from, to) { return OW.series(code, from, to); }
+// Legacy shims
+async function fetchSeries(code, from, to) {
+  const data = await OW.series([code], from, to, 100);
+  return OW.filterType(data, code);
+}
 async function fetchSleepEvents(from, to) { return OW.events('sleep', from, to, 5); }
 async function fetchHealthScores() { return OW.scores(); }
 
@@ -1467,18 +1625,22 @@ async function loadTrends() {
   try {
     const now = new Date();
     const from = new Date(now); from.setDate(from.getDate() - trendRange);
-    const [hrv, rhr, steps, hr] = await Promise.all([
-      fetchSeries('heart_rate_variability_sdnn', from.toISOString(), now.toISOString()),
-      fetchSeries('resting_heart_rate', from.toISOString(), now.toISOString()),
-      fetchSeries('steps', from.toISOString(), now.toISOString()),
-      fetchSeries('heart_rate', from.toISOString(), now.toISOString()),
+
+    // HRV and resting HR have ~1 reading/day — regular fetch covers full range
+    // Steps and heart rate have many readings/day — paginate to get all records
+    const strainFrom = new Date(now); strainFrom.setDate(strainFrom.getDate() - Math.min(trendRange, 14));
+
+    const [hrvData, rhrData, stepsData, hrData] = await Promise.all([
+      OW.series(['heart_rate_variability_sdnn'], from.toISOString(), now.toISOString(), 100),
+      OW.series(['resting_heart_rate'], from.toISOString(), now.toISOString(), 100),
+      OW.seriesAll(['steps'], from.toISOString(), now.toISOString(), 15),
+      OW.seriesAll(['heart_rate'], strainFrom.toISOString(), now.toISOString(), 10),
     ]);
 
-    const grouped = groupByDay;
-    const hrvDay = grouped(hrv, v => Math.round(v));
-    const rhrDay = grouped(rhr, v => Math.round(v));
-    const stepsDay = groupByDaySum(steps);
-    const strainDay = groupByDayStrain(hr);
+    const hrvDay = groupByDay(hrvData, v => Math.round(v));
+    const rhrDay = groupByDay(rhrData, v => Math.round(v));
+    const stepsDay = groupByDaySum(stepsData);
+    const strainDay = groupByDayStrain(hrData);
 
     drawTrend('hrv', hrvDay, 'trend-hrv-val', 'var(--accent)', false);
     drawTrend('rhr', rhrDay, 'trend-rhr-val', 'var(--red)', false);
@@ -1493,7 +1655,7 @@ async function loadTrends() {
 function groupByDay(data, agg) {
   const map = {};
   data.forEach(d => {
-    const day = d.recorded_at.slice(0, 10);
+    const day = d.timestamp.slice(0, 10);
     if (!map[day]) map[day] = [];
     map[day].push(d.value);
   });
@@ -1504,7 +1666,7 @@ function groupByDay(data, agg) {
 function groupByDaySum(data) {
   const map = {};
   data.forEach(d => {
-    const day = d.recorded_at.slice(0, 10);
+    const day = d.timestamp.slice(0, 10);
     map[day] = (map[day] || 0) + d.value;
   });
   return Object.entries(map).sort(([a],[b]) => a.localeCompare(b))
@@ -1514,7 +1676,7 @@ function groupByDaySum(data) {
 function groupByDayStrain(data) {
   const map = {};
   data.forEach(d => {
-    const day = d.recorded_at.slice(0, 10);
+    const day = d.timestamp.slice(0, 10);
     if (!map[day]) map[day] = [];
     map[day].push({ value: d.value });
   });
@@ -1608,12 +1770,63 @@ async function loadSleep() {
       sleepEvents = sleepEvents.filter(e => !e.is_nap);
     }
 
-    if (!sleepEvents.length) {
+    // Check if last night has real sleep_details — if not, fall back to the HR/respiratory proxy
+    const lastNightDate = new Date(now); lastNightDate.setHours(now.getHours() < 12 ? -12 : 12);
+    const hasRecentRealData = sleepEvents.some(e => {
+      const eDate = new Date(e.start_datetime);
+      return (now - eDate) < 36 * 3600 * 1000; // within last 36 hours
+    });
+
+    let proxyResult = null;
+    if (!hasRecentRealData) {
+      // Fetch overnight window: 6pm two days ago through 11am today, to catch last night
+      const windowStart = new Date(now); windowStart.setDate(windowStart.getDate() - 1); windowStart.setHours(18, 0, 0, 0);
+      const windowEnd = new Date(now); windowEnd.setHours(11, 0, 0, 0);
+      if (windowEnd < now && now.getHours() < 11) {
+        // still morning, window end should be today 11am — already correct
+      }
+      const [hrData, respData, rhrData] = await Promise.all([
+        OW.series(['heart_rate'], windowStart.toISOString(), now.toISOString(), 100),
+        OW.series(['respiratory_rate'], windowStart.toISOString(), now.toISOString(), 100),
+        OW.series(['resting_heart_rate'], new Date(now.getTime() - 14*86400000).toISOString(), now.toISOString(), 100),
+      ]);
+      const baselineRhr = rhrData.length ? rhrData.reduce((s,d) => s+d.value, 0) / rhrData.length : null;
+      proxyResult = Scores.sleepProxy(hrData, respData, baselineRhr);
+    }
+
+    if (!sleepEvents.length && !proxyResult) {
       content.innerHTML = `
         <div class="placeholder-card">
           <div class="placeholder-icon">🌙</div>
           <div class="placeholder-text">No sleep data yet<br>Wear your Helio Strap to bed<br>to start tracking sleep</div>
         </div>`;
+    } else if (proxyResult && !hasRecentRealData) {
+      // Show estimated sleep card
+      const hrs = (proxyResult.durationMinutes / 60).toFixed(1);
+      const qColor = proxyResult.qualityScore >= 70 ? 'var(--green)' : proxyResult.qualityScore >= 45 ? 'var(--yellow)' : 'var(--red)';
+      content.innerHTML = `
+        <div class="sleep-overview">
+          <div style="display:flex;align-items:center;justify-content:space-between;">
+            <div class="metric-eyebrow">Last night · Estimated</div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--muted);background:var(--surface2);padding:2px 8px;border-radius:10px;">From HR + breathing</div>
+          </div>
+          <div class="sleep-duration">${hrs}<span style="font-family:var(--mono);font-size:16px;color:var(--muted);"> hrs</span></div>
+          <div style="font-family:var(--mono);font-size:11px;color:${qColor};margin:8px 0;">
+            Quality estimate: ${proxyResult.qualityScore}/100
+          </div>
+          <div class="sleep-metric-row">
+            <div class="sleep-metric"><div class="sleep-metric-val">${proxyResult.avgHr}</div><div class="sleep-metric-lbl">Avg HR</div></div>
+            <div class="sleep-metric"><div class="sleep-metric-val">${proxyResult.minHr}</div><div class="sleep-metric-lbl">Min HR</div></div>
+            <div class="sleep-metric"><div class="sleep-metric-val">${proxyResult.avgRespRate || '—'}</div><div class="sleep-metric-lbl">Resp/min</div></div>
+          </div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--muted);margin-top:12px;line-height:1.6;">
+            Estimated from sustained low heart rate window (${formatTime(proxyResult.startTime)}–${formatTime(proxyResult.endTime)}).
+            Real sleep stage data unavailable for this night — this is a proxy, not measured stages.
+          </div>
+        </div>
+        <div class="section-label">History</div>
+      `;
+      if (sleepEvents.length) appendSleepHistory(sleepEvents, content);
     } else {
       const latest = sleepEvents[0];
       const details = latest.details || {};
@@ -1626,7 +1839,7 @@ async function loadSleep() {
 
       content.innerHTML = `
         <div class="sleep-overview">
-          <div class="metric-eyebrow">Last night</div>
+          <div class="metric-eyebrow">Last night · Measured</div>
           <div class="sleep-duration">${totalH}<span style="font-family:var(--mono);font-size:16px;color:var(--muted);"> hrs</span></div>
           <div class="sleep-stages-bar">
             <div class="stage-deep" style="width:${deep/total*100}%"></div>
@@ -1648,22 +1861,7 @@ async function loadSleep() {
         </div>
         <div class="section-label">History</div>
       `;
-
-      sleepEvents.slice(0, 14).forEach(e => {
-        const d = e.details || {};
-        const hrs = d.sleep_total_duration_minutes ? (d.sleep_total_duration_minutes / 60).toFixed(1) : '—';
-        const pct = d.sleep_total_duration_minutes ? Math.min(100, (d.sleep_total_duration_minutes / 480) * 100) : 0;
-        const date = new Date(e.start_datetime);
-        const label = date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
-        const item = document.createElement('div');
-        item.className = 'sleep-history-item';
-        item.innerHTML = `
-          <div class="sleep-night-date">${label}</div>
-          <div class="sleep-night-dur">${hrs}h</div>
-          <div class="sleep-night-bar"><div class="sleep-night-fill" style="width:${pct}%"></div></div>
-        `;
-        content.appendChild(item);
-      });
+      appendSleepHistory(sleepEvents, content);
     }
   } catch(e) {
     content.innerHTML = `<div class="empty-msg">Could not load sleep data</div>`;
@@ -1671,6 +1869,28 @@ async function loadSleep() {
   }
   document.getElementById('sleep-loading').style.display = 'none';
   content.style.display = 'block';
+}
+
+function formatTime(date) {
+  return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+}
+
+function appendSleepHistory(sleepEvents, content) {
+  sleepEvents.slice(0, 14).forEach(e => {
+    const d = e.details || {};
+    const hrs = d.sleep_total_duration_minutes ? (d.sleep_total_duration_minutes / 60).toFixed(1) : '—';
+    const pct = d.sleep_total_duration_minutes ? Math.min(100, (d.sleep_total_duration_minutes / 480) * 100) : 0;
+    const date = new Date(e.start_datetime);
+    const label = date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+    const item = document.createElement('div');
+    item.className = 'sleep-history-item';
+    item.innerHTML = `
+      <div class="sleep-night-date">${label}</div>
+      <div class="sleep-night-dur">${hrs}h</div>
+      <div class="sleep-night-bar"><div class="sleep-night-fill" style="width:${pct}%"></div></div>
+    `;
+    content.appendChild(item);
+  });
 }
 
 // ─── WORKOUTS ─────────────────────────────────────────────────────────────────
